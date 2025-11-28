@@ -1,1 +1,362 @@
 
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Chess — Play vs Stockfish (GitHub Pages friendly)</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/chessboard-js/1.0.0/chessboard-1.0.0.min.css" />
+<style>
+  :root{
+    --bg:#081021; --panel:#0f1724; --muted:#99a8c4; --accent:#ffd166;
+    --white-square:#f0d9b5; --black-square:#b58863;
+  }
+  html,body{height:100%;margin:0;font-family:Inter,system-ui,Segoe UI,Roboto,Arial;color:#e6eef8;background:linear-gradient(180deg,#061021,#081021);display:flex;align-items:center;justify-content:center;padding:18px;}
+  .wrap{width:min(980px,98vw);background:rgba(255,255,255,0.02);border-radius:12px;padding:18px;box-shadow:0 10px 30px rgba(2,6,23,0.6);display:grid;grid-template-columns:420px 1fr;gap:18px;align-items:start;}
+  .board-panel{display:flex;flex-direction:column;gap:12px;align-items:center;}
+  #board{width:100%;max-width:420px;}
+  .controls{display:flex;gap:8px;flex-wrap:wrap;justify-content:center;}
+  button{background:var(--panel);color:#dfe9ff;border:1px solid rgba(255,255,255,0.03);padding:8px 12px;border-radius:8px;cursor:pointer;font-weight:600}
+  button.primary{background:linear-gradient(90deg,#2a9d8f,#2bb39a);color:white}
+  .status{font-size:14px;color:var(--muted);text-align:center}
+  .right-panel{padding:6px 12px;display:flex;flex-direction:column;gap:12px;}
+  .row{display:flex;gap:8px;align-items:center}
+  label{color:var(--muted);font-size:13px}
+  select,input[type=range]{width:100%}
+  .moves{height:200px;overflow:auto;background:rgba(255,255,255,0.02);padding:8px;border-radius:8px;color:#cfe8ff;font-family:monospace;font-size:13px}
+  .footer{color:var(--muted);font-size:12px;text-align:center;margin-top:6px}
+  @media (max-width:900px){ .wrap{grid-template-columns:1fr; } .board-panel{order:1} .right-panel{order:2} #board{max-width:88vw} }
+  /* color overrides for chessboard.js */
+  .white-1e1d7{ background: var(--white-square) !important; }
+  .black-3c85d{ background: var(--black-square) !important; }
+</style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="board-panel">
+      <div id="board"></div>
+      <div class="controls">
+        <button id="newBtn" class="primary">New Game</button>
+        <button id="undoBtn">Undo</button>
+        <button id="flipBtn">Flip Board</button>
+        <button id="toggleEngineBtn">Engine: ON</button>
+      </div>
+      <div class="status" id="status">Loading libraries...</div>
+      <div style="font-size:12px;color:var(--muted);text-align:center">Works on GitHub Pages — open via HTTPS.</div>
+    </div>
+
+    <div class="right-panel">
+      <div class="row">
+        <label style="width:110px">Engine strength (ms)</label>
+        <input id="difficulty" type="range" min="50" max="2000" value="300" />
+      </div>
+      <div class="row">
+        <label style="width:110px">Your side</label>
+        <select id="sideSelect">
+          <option value="white" selected>White (you)</option>
+          <option value="black">Black (you)</option>
+        </select>
+      </div>
+
+      <div>
+        <label>Move list (SAN)</label>
+        <div class="moves" id="moveList"></div>
+      </div>
+
+      <div>
+        <label>Notes</label>
+        <div style="background:rgba(255,255,255,0.02);padding:8px;border-radius:8px;color:var(--muted);font-size:13px">
+          - Drag pieces to move. Illegal moves rejected.<br>
+          - Page attempts to run Stockfish by fetching the script and creating a worker from it (works on GitHub Pages).<br>
+          - If Stockfish can't be loaded, a fallback AI will play so you can still use the site.
+        </div>
+      </div>
+
+      <div class="footer">Drop this file into a GitHub Pages site (root or docs). Example: <code>index.html</code>. 🍀</div>
+    </div>
+  </div>
+
+<!-- External libs (chess.js + chessboard.js) -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/chess.js/0.13.0/chess.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/chessboard-js/1.0.0/chessboard-1.0.0.min.js"></script>
+
+<script>
+/* GitHub-Pages-friendly single-file chess site:
+   - loads stockfish.js as text, creates Blob -> Worker (avoids new Worker(CDN_URL) CORS issues)
+   - falls back to a small random/capture-preferring AI if needed
+*/
+
+(async function(){
+  // DOM
+  const statusEl = document.getElementById('status');
+  const moveListEl = document.getElementById('moveList');
+  const newBtn = document.getElementById('newBtn');
+  const undoBtn = document.getElementById('undoBtn');
+  const flipBtn = document.getElementById('flipBtn');
+  const toggleEngineBtn = document.getElementById('toggleEngineBtn');
+  const difficultyEl = document.getElementById('difficulty');
+  const sideSelect = document.getElementById('sideSelect');
+
+  // Game state
+  const game = new Chess();
+  let board = null;
+  let engineWorker = null;
+  let engineEnabled = true;
+  let engineBusy = false;
+  let engineTimeout = Number(difficultyEl.value); // ms
+  let userColor = 'w';
+  let stockfishLoaded = false;
+
+  // UI helpers
+  function updateUI(){
+    const history = game.history({verbose:false});
+    let html = '';
+    for(let i=0;i<history.length;i+=2){
+      const moveNo = (i/2)+1;
+      const w = history[i] || '';
+      const b = history[i+1] || '';
+      html += `<div style="padding:2px 0">${moveNo}. ${w} ${b}</div>`;
+    }
+    moveListEl.innerHTML = html || '<i style="color:var(--muted)">No moves yet</i>';
+
+    if (game.in_checkmate()){
+      statusEl.textContent = "Checkmate — " + (game.turn()==='w' ? 'Black' : 'White') + " wins";
+    } else if (game.in_draw()){
+      statusEl.textContent = "Draw";
+    } else {
+      statusEl.textContent = (game.turn()==='w' ? 'White' : 'Black') + " to move" + (game.in_check() ? " — check!" : "") + (engineBusy ? " (engine thinking...)" : "");
+    }
+  }
+
+  // Board config
+  const cfg = {
+    draggable: true,
+    position: 'start',
+    pieceTheme: (piece) => 'https://cdnjs.cloudflare.com/ajax/libs/chessboard-js/1.0.0/img/chesspieces/wikipedia/' + piece + '.png',
+    onDragStart: onDragStart,
+    onDrop: onDrop,
+    onSnapEnd: onSnapEnd,
+    onMouseoverSquare: onMouseoverSquare,
+    onMouseoutSquare: onMouseoutSquare,
+    orientation: 'white',
+    moveSpeed: 'slow',
+  };
+  board = Chessboard('board', cfg);
+
+  // highlights
+  function removeHighlights(){ document.querySelectorAll('#board .square-55d63').forEach(s => s.style.boxShadow = ''); }
+  function greySquare(square){ const sq = document.querySelector('#board .square-' + square); if (sq) sq.style.boxShadow = 'inset 0 0 0 4px rgba(255,210,77,0.25)'; }
+
+  function onMouseoverSquare(square) {
+    removeHighlights();
+    const moves = game.moves({square: square, verbose: true});
+    if (!moves.length) return;
+    greySquare(square);
+    moves.forEach(m => greySquare(m.to));
+  }
+  function onMouseoutSquare() { removeHighlights(); }
+
+  function onDragStart(source, piece) {
+    if (game.game_over()) return false;
+    if ((game.turn() === 'w' && piece.search(/^b/) !== -1) ||
+        (game.turn() === 'b' && piece.search(/^w/) !== -1)) return false;
+    if (engineBusy && game.turn() !== userColor) return false;
+  }
+
+  function onDrop(source, target) {
+    removeHighlights();
+    const move = game.move({from: source, to: target, promotion: 'q'});
+    if (move === null) return 'snapback';
+    board.position(game.fen());
+    updateUI();
+    setTimeout(maybeEngineMove, 40);
+  }
+
+  function onSnapEnd() { board.position(game.fen()); }
+
+  // Buttons
+  newBtn.addEventListener('click', () => {
+    game.reset(); board.start(); updateUI();
+    if (engineEnabled && userColor==='b') setTimeout(maybeEngineMove, 80);
+  });
+
+  undoBtn.addEventListener('click', () => {
+    if (engineBusy) return;
+    game.undo(); game.undo();
+    board.position(game.fen()); updateUI();
+  });
+
+  flipBtn.addEventListener('click', () => board.flip());
+
+  toggleEngineBtn.addEventListener('click', () => {
+    engineEnabled = !engineEnabled;
+    toggleEngineBtn.textContent = 'Engine: ' + (engineEnabled ? 'ON' : 'OFF');
+    if (engineEnabled && game.turn() !== userColor) maybeEngineMove();
+  });
+
+  difficultyEl.addEventListener('input', (e) => { engineTimeout = Number(e.target.value); });
+
+  sideSelect.addEventListener('change', (e) => {
+    userColor = e.target.value === 'white' ? 'w' : 'b';
+    board.orientation(e.target.value);
+    game.reset(); board.start(); updateUI();
+    if (engineEnabled && userColor === 'b') setTimeout(maybeEngineMove, 80);
+  });
+
+  // Engine: fetch stockfish and create worker from blob (GitHub Pages-friendly)
+  async function initStockfishViaBlob(){
+    const urlsToTry = [
+      'https://cdn.jsdelivr.net/npm/stockfish@15.1.0/src/stockfish.js',
+      'https://unpkg.com/stockfish@15.1.0/src/stockfish.js'
+    ];
+    for (const url of urlsToTry){
+      try {
+        statusEl.textContent = 'Loading Stockfish...';
+        const resp = await fetch(url);
+        if (!resp.ok) throw new Error('fetch failed: ' + resp.status);
+        const text = await resp.text();
+        const blob = new Blob([text], { type: 'application/javascript' });
+        const blobURL = URL.createObjectURL(blob);
+        const worker = new Worker(blobURL);
+        // small sanity check: send "uci" and wait for "uciok" or "readyok"
+        return new Promise((resolve, reject) => {
+          let ok = false;
+          const timeout = setTimeout(() => {
+            worker.terminate();
+            reject(new Error('Stockfish worker timeout'));
+          }, 6000);
+          worker.onmessage = (e) => {
+            const m = (typeof e.data === 'string') ? e.data : (e.data && e.data.message) ? e.data.message : '';
+            if (m.includes('uciok') || m.includes('readyok') || m.includes('id name')) {
+              clearTimeout(timeout);
+              ok = true;
+              resolve(worker);
+            }
+            // ignore other messages
+          };
+          worker.onerror = (err) => {
+            clearTimeout(timeout);
+            try { worker.terminate(); } catch(e){}
+            reject(err || new Error('worker error'));
+          };
+          // send basic init
+          try {
+            worker.postMessage('uci');
+            worker.postMessage('isready');
+            worker.postMessage('ucinewgame');
+          } catch (err) {
+            clearTimeout(timeout);
+            try { worker.terminate(); } catch(e){}
+            reject(err);
+          }
+        });
+      } catch (err) {
+        // try next URL
+        console.warn('Stockfish fetch/worker failed for', url, err);
+      }
+    }
+    throw new Error('All Stockfish fetch attempts failed');
+  }
+
+  async function setupEngine(){
+    try {
+      engineWorker = await initStockfishViaBlob();
+      // configure
+      engineWorker.postMessage('setoption name Hash value 32');
+      engineWorker.onmessage = (e) => {
+        const text = typeof e.data === 'string' ? e.data : (e.data && e.data.message) ? e.data.message : '';
+        if (text.startsWith('bestmove')) {
+          const parts = text.split(' ');
+          const best = parts[1];
+          if (best && best !== '(none)'){
+            const from = best.substring(0,2);
+            const to = best.substring(2,4);
+            const promo = best.length>4 ? best[4] : undefined;
+            game.move({from, to, promotion: promo || 'q'});
+            board.position(game.fen());
+          }
+          engineBusy = false;
+          updateUI();
+          if (engineEnabled && game.turn() !== userColor) setTimeout(maybeEngineMove, 40);
+        } else {
+          // optional: parse info lines to show thinking depth/score
+          // keep status light
+          if (text.includes('info') && text.includes('score')) statusEl.textContent = 'Engine thinking...';
+        }
+      };
+      engineWorker.onerror = (e) => {
+        console.error('Engine worker error', e);
+        try { engineWorker.terminate(); } catch(e){}
+        engineWorker = null;
+        statusEl.textContent = 'Stockfish failed — using fallback AI.';
+      };
+      stockfishLoaded = true;
+      statusEl.textContent = 'Stockfish ready.';
+      // if engine should move first:
+      if (engineEnabled && userColor === 'b') setTimeout(maybeEngineMove, 80);
+    } catch (err) {
+      console.warn('Stockfish not available:', err);
+      engineWorker = null;
+      stockfishLoaded = false;
+      statusEl.textContent = 'Stockfish not available — using fallback AI.';
+      // if engine should move first:
+      if (engineEnabled && userColor === 'b') setTimeout(maybeEngineMove, 80);
+    }
+  }
+
+  function sendToEngine(cmd){
+    if (!engineWorker) return;
+    try { engineWorker.postMessage(cmd); } catch (err) { console.warn('sendToEngine failed', err); }
+  }
+
+  function maybeEngineMove(){
+    if (!engineEnabled) return;
+    if (game.game_over()) return;
+    if (game.turn() === userColor) return;
+    if (stockfishLoaded && engineWorker){
+      engineBusy = true;
+      updateUI();
+      sendToEngine('position fen ' + game.fen());
+      sendToEngine('go movetime ' + Math.max(50, engineTimeout));
+      return;
+    }
+    // fallback
+    fallbackEngineMove();
+  }
+
+  function fallbackEngineMove(){
+    engineBusy = true;
+    statusEl.textContent = 'Engine (fallback) thinking...';
+    setTimeout(() => {
+      const moves = game.moves();
+      if (moves.length === 0) { engineBusy = false; updateUI(); return; }
+      // prefer captures
+      const captureMoves = moves.filter(m => m.includes('x'));
+      const pool = captureMoves.length ? captureMoves : moves;
+      const pick = pool[Math.floor(Math.random() * pool.length)];
+      game.move(pick);
+      board.position(game.fen());
+      engineBusy = false;
+      updateUI();
+      if (engineEnabled && game.turn() !== userColor) setTimeout(maybeEngineMove, 80);
+    }, Math.min(800, Math.max(60, engineTimeout)));
+  }
+
+  // initialize everything
+  updateUI();
+  await setupEngine();
+
+  // If user chose Black on load, engine should move
+  if (engineEnabled && userColor === 'b') setTimeout(maybeEngineMove, 100);
+
+  // visibility handling (no-op but left for future improvements)
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) {
+      // we don't attempt to interrupt the engine; keep it simple
+    }
+  });
+
+})();
+</script>
+</body>
+</html>
